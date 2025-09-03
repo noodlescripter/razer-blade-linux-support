@@ -52,6 +52,8 @@ echo "🎉 Prerequisites complete!"
 # --- Install Razer packages ---
 echo "--> Step 3: Installing Razer packages..."
 cd razer_control_gui
+chmod +x power_state_handler.sh
+cp power_state_handler.sh $HOME
 
 ./install.sh install
 

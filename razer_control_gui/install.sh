@@ -10,6 +10,18 @@ detect_init_system() {
     fi
 }
 
+check_status() {
+    echo "Checking razercontrol service status..."
+    case $INIT_SYSTEM in
+    systemd)
+        systemctl --user status razercontrol --no-pager
+        ;;
+    openrc)
+        rc-service razercontrol status
+        ;;
+    esac
+}
+
 install() {
     echo "Building the project..."
     cargo build --release # TODO: The GUI should be optional. At least for now. Before releasing this, it sould be turned into a feature with an explicit cli switch to install it
@@ -135,8 +147,11 @@ main() {
     uninstall)
         uninstall
         ;;
+    status)
+        check_status
+        ;;
     *)
-        echo "Usage: $0 {install|uninstall}"
+        echo "Usage: $0 {install|uninstall|status}"
         exit 1
         ;;
     esac

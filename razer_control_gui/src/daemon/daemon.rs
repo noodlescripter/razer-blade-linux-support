@@ -87,6 +87,7 @@ fn main() {
     start_keyboard_animator_task();
     start_screensaver_monitor_task();
     start_battery_monitor_task();
+    start_temperature_monitor_task();
     let clean_thread = start_shutdown_task();
 
     if let Some(listener) = comms::create() {
@@ -232,6 +233,49 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                 if let Ok(mut d) = DEV_MANAGER.lock() {
                     d.set_ac_state(*online);
                 }
+                
+                // Run power-handler.sh from user home directory when AC adapter is plugged or unplugged
+                let event_message = if *online {
+                    "AC adapter plugged in, running power-handler.sh"
+                } else {
+                    "AC adapter unplugged, running power-handler.sh"
+                };
+                
+                info!("{}", event_message);
+                
+                // Wait 2 seconds before running the script
+                thread::sleep(std::time::Duration::from_secs(2));
+                
+                // Get user home directory and construct path to power-handler.sh
+                if let Ok(home_dir) = std::env::var("HOME") {
+                    let script_path = std::path::Path::new(&home_dir).join("power_state_handler.sh");
+                    
+                    if script_path.exists() {
+                        let output = std::process::Command::new("bash")
+                            .arg(&script_path)
+                            .arg(if *online { "plugged" } else { "unplugged" })
+                            .output();
+                        
+                        match output {
+                            Ok(result) => {
+                                if result.status.success() {
+                                    info!("power_state_handler.sh executed successfully");
+                                } else {
+                                    error!("power-handler.sh failed with exit code: {:?}, stderr: {}", 
+                                        result.status.code(),
+                                        String::from_utf8_lossy(&result.stderr));
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error executing power_state_handler.sh: {}", e);
+                            }
+                        }
+                    } else {
+                        info!("power_state_handler.sh not found at {}, skipping execution", script_path.display());
+                    }
+                } else {
+                    error!("Could not determine user home directory");
+                }
             }
             true
         });
@@ -278,6 +322,149 @@ pub fn start_shutdown_task() -> JoinHandle<()> {
         }
         std::process::exit(0);
     })
+}
+
+fn start_temperature_monitor_task() -> JoinHandle<()> {
+    thread::spawn(move || {
+        info!("Starting temperature monitoring task");
+        
+        // Temperature thresholds in Celsius
+        const TEMP_LOW: f32 = 50.0;      // Below this: minimum fan speed
+        const TEMP_MEDIUM: f32 = 65.0;   // Above this: medium fan speed
+        const TEMP_HIGH: f32 = 75.0;     // Above this: high fan speed
+        const TEMP_CRITICAL: f32 = 85.0; // Above this: maximum fan speed
+        
+        // Fan speeds (0 = auto, or RPM values)
+        const FAN_AUTO: i32 = 0;
+        const FAN_LOW: i32 = 2000;
+        const FAN_MEDIUM: i32 = 3500;
+        const FAN_HIGH: i32 = 4500;
+        const FAN_MAX: i32 = 5500;
+        
+        let mut last_fan_speed: i32 = -1; // Track last set speed to avoid unnecessary changes
+        
+        loop {
+            if let Some(cpu_temp) = get_cpu_temperature() {
+                info!("CPU Temperature: {:.1}°C", cpu_temp);
+                
+                // Determine required fan speed based on temperature
+                let required_fan_speed = if cpu_temp < TEMP_LOW {
+                    FAN_AUTO
+                } else if cpu_temp < TEMP_MEDIUM {
+                    FAN_LOW
+                } else if cpu_temp < TEMP_HIGH {
+                    FAN_MEDIUM
+                } else if cpu_temp < TEMP_CRITICAL {
+                    FAN_HIGH
+                } else {
+                    FAN_MAX
+                };
+                
+                // Only change fan speed if it's different from last setting
+                if required_fan_speed != last_fan_speed {
+                    if let Ok(mut d) = DEV_MANAGER.lock() {
+                        // Get current AC state to set appropriate fan speed
+                        if let Some(laptop) = d.get_device() {
+                            let ac_state = laptop.get_ac_state();
+                            let success = d.set_fan_rpm(ac_state, required_fan_speed);
+                            
+                            if success {
+                                last_fan_speed = required_fan_speed;
+                                let speed_desc = match required_fan_speed {
+                                    0 => "AUTO",
+                                    FAN_LOW => "LOW",
+                                    FAN_MEDIUM => "MEDIUM", 
+                                    FAN_HIGH => "HIGH",
+                                    FAN_MAX => "MAXIMUM",
+                                    _ => "CUSTOM"
+                                };
+                                info!("Temperature-based fan control: Set fan to {} ({}RPM) due to {:.1}°C", 
+                                     speed_desc, required_fan_speed, cpu_temp);
+                            } else {
+                                error!("Failed to set fan speed to {}", required_fan_speed);
+                            }
+                        }
+                    }
+                }
+            } else {
+                error!("Could not read CPU temperature");
+            }
+            
+            // Check temperature every 10 seconds
+            thread::sleep(std::time::Duration::from_secs(10));
+        }
+    })
+}
+
+fn get_cpu_temperature() -> Option<f32> {
+    // Try to get temperature using sensors command
+    match std::process::Command::new("sensors")
+        .arg("-A")  // Show all sensors
+        .arg("-u")  // Raw output
+        .output() 
+    {
+        Ok(output) => {
+            if output.status.success() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                
+                // Look for CPU temperature patterns
+                // Common patterns: Core 0, Package id 0, Tctl, CPU
+                for line in output_str.lines() {
+                    if line.contains("_input:") && 
+                       (line.contains("core") || line.contains("package") || 
+                        line.contains("cpu") || line.contains("tctl")) {
+                        
+                        // Extract temperature value
+                        if let Some(temp_str) = line.split(':').nth(1) {
+                            if let Ok(temp) = temp_str.trim().parse::<f32>() {
+                                // Convert from millidegrees if needed, or return as-is if already in celsius
+                                let celsius_temp = if temp > 1000.0 { temp / 1000.0 } else { temp };
+                                
+                                // Sanity check: reasonable CPU temperature range
+                                if celsius_temp > 20.0 && celsius_temp < 120.0 {
+                                    return Some(celsius_temp);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Fallback: try simpler sensors output format
+            match std::process::Command::new("sensors").output() {
+                Ok(simple_output) => {
+                    if simple_output.status.success() {
+                        let output_str = String::from_utf8_lossy(&simple_output.stdout);
+                        
+                        for line in output_str.lines() {
+                            if (line.contains("Core") || line.contains("Package") || 
+                                line.contains("CPU") || line.contains("Tctl")) &&
+                               line.contains("°C") {
+                                
+                                // Extract temperature using regex-like parsing
+                                if let Some(temp_part) = line.split_whitespace()
+                                    .find(|part| part.contains("°C")) {
+                                    
+                                    let temp_str = temp_part.replace("°C", "").replace("+", "");
+                                    if let Ok(temp) = temp_str.parse::<f32>() {
+                                        if temp > 20.0 && temp < 120.0 {
+                                            return Some(temp);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        Err(e) => {
+            error!("Error executing sensors command: {}", e);
+        }
+    }
+    
+    None
 }
 
 fn handle_data(mut stream: UnixStream) {
